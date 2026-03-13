@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+motor
+pandas
+opencv-python
+numpy
+paddleocr
+python-multipart

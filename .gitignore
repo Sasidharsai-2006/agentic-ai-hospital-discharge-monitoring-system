@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+backend_log.txt
+*.png
+*.jpg
+*.jpeg
+uploads/
+
+# Node/React
+node_modules/
+dist/
+dist-ssr
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
