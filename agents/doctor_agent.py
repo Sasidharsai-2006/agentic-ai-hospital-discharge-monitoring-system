@@ -1,35 +1,46 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
-def decide_discharge(vitals_history, risk_level, bill_paid):
+def decide_discharge(vitals_history, has_critical_alerts_24h, total_payments, total_bill):
     """
     Conditions:
-    1. Vitals stable for last 48 hours:
+    1. Minimum 5 records
+    2. Sort vitals by timestamp
+    3. Rules for last 48 hours:
        - SpO2 > 94
        - Temp < 38
        - Heart Rate < 100
-    2. risk_level = LOW_RISK
-    3. bill_paid = true
+    4. No CRITICAL alerts in last 24h
+    5. total_payments >= total_bill
     """
-    # vitals_history is expected to be a list of vital documents from the last 48 hours
-    if not vitals_history:
-        return False, "No vitals history found for the last 48 hours."
+    # 1) Minimum 5 records
+    if not vitals_history or len(vitals_history) < 5:
+        return False, f"Insufficient vitals history. Need at least 5 readings (found {len(vitals_history) if vitals_history else 0})."
 
-    for v in vitals_history:
+    # 2) Sort vitals by timestamp ascending
+    try:
+        sorted_vitals = sorted(vitals_history, key=lambda x: x.get("timestamp") or datetime.min)
+    except Exception:
+        sorted_vitals = vitals_history
+
+    # 3) Apply rules
+    for v in sorted_vitals:
         spo2 = v.get("spo2")
         temp = v.get("temperature")
         hr = v.get("heart_rate")
         
-        if spo2 is not None and spo2 <= 94:
+        if spo2 is not None and float(spo2) <= 94:
             return False, f"Unstable SpO2 detected: {spo2}"
-        if temp is not None and temp >= 38:
+        if temp is not None and float(temp) >= 38:
             return False, f"Unstable Temperature detected: {temp}"
-        if hr is not None and hr >= 100:
+        if hr is not None and float(hr) >= 100:
             return False, f"Unstable Heart Rate detected: {hr}"
 
-    if risk_level != "LOW_RISK":
-        return False, "Risk level is still HIGH."
+    # 4) Check CRITICAL alerts in last 24h
+    if has_critical_alerts_24h:
+        return False, "CRITICAL alerts detected in the last 24 hours."
     
-    if not bill_paid:
-        return False, "Hospital bill is not yet paid."
+    # 5) Payment logic
+    if total_payments < total_bill:
+        return False, f"Pending payment. Total paid: {total_payments}, Total bill: {total_bill}."
 
     return True, "Patient is stable and ready for discharge."

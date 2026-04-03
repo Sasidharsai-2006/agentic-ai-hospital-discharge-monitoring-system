@@ -7,6 +7,10 @@ import os
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # Database
 from database.mongodb import db, patients_col, vitals_col, billing_col, insurance_col, alerts_col, prescriptions_col, payments_col
@@ -41,6 +45,12 @@ async def verify_patient_exists(patient_id: str):
     patient = await patients_col.find_one({"patient_id": p_id})
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
+    return patient
+
+async def verify_patient_active(patient_id: str):
+    patient = await verify_patient_exists(patient_id)
+    if patient.get("discharge"):
+        raise HTTPException(status_code=400, detail="Patient is already discharged")
     return patient
 
 # CORS
@@ -123,7 +133,7 @@ async def upload_vitals(
     image: UploadFile = File(...)
 ):
     await verify_admin(request)
-    await verify_patient_exists(patient_id)
+    await verify_patient_active(patient_id)
 
     os.makedirs("uploads", exist_ok=True)
     file_path = os.path.join("uploads", f"{uuid.uuid4()}_{image.filename}")
@@ -182,7 +192,7 @@ async def upload_vitals(
 async def assign_medicine(request: Request, patient_id: str = Form(...), medicine_name: str = Form(...), quantity: int = Form(...)):
     await verify_admin(request)
     p_id = patient_id.lower()
-    await verify_patient_exists(p_id)
+    await verify_patient_active(p_id)
 
     availability = check_medicine_availability(medicine_name, quantity)
     if availability == "out_of_stock":
@@ -323,7 +333,7 @@ async def add_payment(
 ):
     await verify_admin(request)
     patient_id = patient_id.lower()
-    await verify_patient_exists(patient_id)
+    await verify_patient_active(patient_id)
     
     payment_doc = {
         "patient_id": patient_id,
@@ -346,30 +356,43 @@ async def get_payments(patient_id: str):
 @app.get("/decision/{patient_id}")
 async def get_decision(patient_id: str):
     patient_id = patient_id.lower()
+    patient = await verify_patient_exists(patient_id)
+    
+    if patient.get("discharge"):
+        return {"discharge": False, "reason": "Already discharged"}
+
     # Last 48h vitals
-    time_limit = datetime.now() - timedelta(hours=48)
-    vitals_history = await vitals_col.find({
-        "patient_id": patient_id,
-        "timestamp": {"$gte": time_limit}
-    }).to_list(100)
+    time_limit_48h = datetime.now() - timedelta(hours=48)
+    vitals_history = await vitals_col.find({"patient_id": patient_id, "timestamp": {"$gte": time_limit_48h}}).to_list(100)
     
-    latest_vitals = await vitals_col.find_one({"patient_id": patient_id}, sort=[("timestamp", -1)])
-    risk_level = analyze_vitals(latest_vitals) if latest_vitals else "UNKNOWN"
+    # Check for Critical alerts in last 24h
+    time_limit_24h = datetime.now() - timedelta(hours=24)
+    alerts_24h = await alerts_col.find({"patient_id": patient_id, "timestamp": {"$gte": time_limit_24h}}).to_list(100)
+    has_critical_alerts = any("CRITICAL" in a.get("message", "").upper() or "CRITICAL" in a.get("alert_type", "").upper() for a in alerts_24h)
     
-    billing = await billing_col.find_one({"patient_id": patient_id})
-    bill_paid = billing.get("bill_paid", False) if billing else False
+    # Billing info
+    bill_info = await get_billing(patient_id)
+    total_bill = bill_info.get("total_bill", 0)
+    total_payments = bill_info.get("paid_amount", 0) + bill_info.get("insurance_coverage", 0)
     
-    discharge, reason = decide_discharge(vitals_history, risk_level, bill_paid)
+    discharge, reason = decide_discharge(vitals_history, has_critical_alerts, total_payments, total_bill)
     
     if discharge:
-        await patients_col.update_one({"patient_id": patient_id}, {"$set": {"status": "discharged"}})
+        await patients_col.update_one(
+            {"patient_id": patient_id}, 
+            {"$set": {
+                "status": "discharged", 
+                "discharge": True, 
+                "discharged_at": datetime.now(), 
+                "discharge_type": "Regular", 
+                "doctor_notes": "Patient recovered."
+            }}
+        )
         
     return {
         "patient_id": patient_id,
         "discharge": discharge,
-        "reason": reason,
-        "risk_level": risk_level,
-        "bill_paid": bill_paid
+        "reason": reason
     }
 
 @app.get("/patients")
@@ -426,6 +449,142 @@ async def delete_prescription(request: Request, presc_id: str):
     except Exception as e:
         print(f"DEBUG: Delete error: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid ID or error: {str(e)}")
+
+@app.get("/discharge_report/{patient_id}")
+async def get_discharge_report(patient_id: str):
+    patient_id = patient_id.lower()
+    patient = await verify_patient_exists(patient_id)
+    patient_resp = {k: v for k, v in patient.items() if k != "_id"}
+    
+    vitals = await get_vitals(patient_id)
+    prescriptions = await get_prescriptions(patient_id)
+    billing = await get_billing(patient_id)
+    payments = await get_payments(patient_id)
+    alerts = await get_alerts(patient_id)
+    
+    decision = await get_decision(patient_id)
+    
+    return {
+        "patient": patient_resp,
+        "vitals": vitals,
+        "prescriptions": prescriptions,
+        "billing": billing,
+        "payments": payments,
+        "alerts": alerts,
+        "decision": decision
+    }
+
+@app.post("/generate_report/{patient_id}")
+async def generate_report(request: Request, patient_id: str):
+    await verify_admin(request)
+    patient_id = patient_id.lower()
+    
+    report_data = await get_discharge_report(patient_id)
+    patient = report_data["patient"]
+    vitals = report_data["vitals"]
+    prescriptions = report_data["prescriptions"]
+    billing = report_data["billing"]
+    payments = report_data["payments"]
+    
+    os.makedirs("reports", exist_ok=True)
+    pdf_path = os.path.join("reports", f"{patient_id}_discharge.pdf")
+    
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    # Title
+    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], alignment=1, spaceAfter=20)
+    elements.append(Paragraph("VITALGUARD AI - DISCHARGE REPORT", title_style))
+    
+    # Patient Info
+    elements.append(Paragraph("Patient Information", styles['Heading2']))
+    p_info = [
+        [f"Name: {patient.get('name', 'N/A')}", f"ID: {patient.get('patient_id', 'N/A')}"],
+        [f"Age: {patient.get('age', 'N/A')}", f"Disease: {patient.get('disease', 'N/A')}"],
+        [f"Status: {patient.get('status', 'N/A')}", f"Discharged At: {patient.get('discharged_at', 'N/A')}"]
+    ]
+    t_info = Table(p_info, colWidths=[250, 250])
+    t_info.setStyle(TableStyle([
+        ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    elements.append(t_info)
+    elements.append(Spacer(1, 10))
+    
+    # Vitals Table
+    if vitals:
+        elements.append(Paragraph("Vitals History (Last 5 records)", styles['Heading2']))
+        v_data = [["Time", "SpO2", "Heart Rate", "Temp", "BP"]]
+        for v in vitals[:5]:
+            ts = v.get("timestamp")
+            ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, 'strftime') else str(ts)
+            v_data.append([
+                ts_str,
+                str(v.get("spo2", "-")),
+                str(v.get("heart_rate", "-")),
+                str(v.get("temperature", "-")),
+                str(v.get("bp", "-"))
+            ])
+        t_vitals = Table(v_data, colWidths=[120, 70, 80, 70, 100])
+        t_vitals.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ]))
+        elements.append(t_vitals)
+        elements.append(Spacer(1, 10))
+        
+    # Medicines
+    if prescriptions:
+        elements.append(Paragraph("Medicines Prescribed", styles['Heading2']))
+        m_data = [["Medicine", "Quantity", "Total Cost"]]
+        for p in prescriptions:
+            m_data.append([
+                str(p.get("medicine_name", "-")),
+                str(p.get("quantity", "-")),
+                f"${p.get('total_cost', 0)}"
+            ])
+        t_meds = Table(m_data, colWidths=[250, 100, 100])
+        t_meds.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ]))
+        elements.append(t_meds)
+        elements.append(Spacer(1, 10))
+        
+    # Billing
+    elements.append(Paragraph("Billing Summary", styles['Heading2']))
+    b_data = [
+        ["Total Bill:", f"${billing.get('total_bill', 0)}"],
+        ["Total Payments:", f"${sum(p.get('amount',0) for p in payments)}"],
+        ["Remaining:", f"${billing.get('remaining_balance', 0)}"]
+    ]
+    t_bill = Table(b_data, colWidths=[200, 200])
+    t_bill.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+    elements.append(t_bill)
+    elements.append(Spacer(1, 10))
+    
+    # Final Status
+    elements.append(Paragraph("Final Decisions & Notes", styles['Heading2']))
+    decision_info = report_data.get("decision", {})
+    elements.append(Paragraph(f"Discharge Ready: {decision_info.get('discharge', False)}", styles['Normal']))
+    elements.append(Paragraph(f"Reason: {decision_info.get('reason', '')}", styles['Normal']))
+    if patient.get("doctor_notes"):
+        elements.append(Paragraph(f"Doctor Notes: {patient.get('doctor_notes')}", styles['Normal']))
+    
+    elements.append(Spacer(1, 30))
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], alignment=1, textColor=colors.gray)
+    elements.append(Paragraph("Generated by VitalGuard AI", footer_style))
+    
+    doc.build(elements)
+    
+    return {"file_url": f"/reports/{patient_id}_discharge.pdf"}
 
 if __name__ == "__main__":
     import uvicorn

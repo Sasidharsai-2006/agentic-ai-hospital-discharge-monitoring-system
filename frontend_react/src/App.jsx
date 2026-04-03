@@ -189,8 +189,9 @@ function App() {
       )}
 
       {view === 'admin' && <AdminPanel logout={logout} onSelectPatient={(pid) => { setPatientIdInput(pid); setView('patient_detail'); }} setAlert={setCriticalAlert} />}
-      {view === 'patient_detail' && <PatientDashboard patient_id={patientIdInput} role={user.role} logout={() => setView('admin')} setAlert={setCriticalAlert} />}
-      {view === 'patient' && <PatientDashboard patient_id={user.patient_id} role={user.role} logout={logout} setAlert={setCriticalAlert} />}
+      {view === 'patient_detail' && <PatientDashboard patient_id={patientIdInput} role={user.role} logout={() => setView('admin')} setAlert={setCriticalAlert} onDischarge={() => setView('discharge_page')} />}
+      {view === 'patient' && <PatientDashboard patient_id={user.patient_id} role={user.role} logout={logout} setAlert={setCriticalAlert} onDischarge={() => setView('discharge_page')} />}
+      {view === 'discharge_page' && <DischargePage patient_id={user?.role === 'patient' ? user.patient_id : patientIdInput} role={user.role} goBack={() => setView(user?.role === 'patient' ? 'patient' : 'patient_detail')} />}
     </div>
   );
 }
@@ -321,7 +322,7 @@ function AdminPanel({ logout, onSelectPatient, setAlert }) {
   );
 }
 
-function PatientDashboard({ patient_id, role, logout, setAlert }) {
+function PatientDashboard({ patient_id, role, logout, setAlert, onDischarge }) {
   const [patient, setPatient] = useState(null);
   const [vitals, setVitals] = useState([]);
   const [latestVitals, setLatestVitals] = useState(null);
@@ -482,6 +483,25 @@ function PatientDashboard({ patient_id, role, logout, setAlert }) {
             <h4 className="text-xs font-bold text-white leading-none">{patient.name}</h4>
             <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">{patient.patient_id}</span>
           </div>
+          {isAdmin && (
+             <button
+               onClick={async () => {
+                 if (!patient.discharge) {
+                   try { await axios.get(`${API_BASE}/decision/${patient_id}`); } catch (e) {}
+                 }
+                 if (onDischarge) onDischarge();
+               }}
+               disabled={patient.discharge}
+               className={`hidden md:block px-4 py-2 rounded-xl font-bold uppercase text-[10px] tracking-widest transition-all ${patient.discharge ? 'bg-gray-600/20 text-gray-500 cursor-not-allowed border border-white/5' : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg'}`}
+             >
+               {patient.discharge ? 'Already Discharged' : 'Check Discharge'}
+             </button>
+          )}
+          {!isAdmin && patient.discharge && (
+             <button onClick={onDischarge} className="hidden md:block px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold uppercase text-[10px] tracking-widest">
+               View Discharge Report
+             </button>
+          )}
           <button onClick={logout} className="p-2 bg-white/5 rounded-xl hover:bg-white/10 transition-all">
             <LogOut size={20}/>
           </button>
@@ -792,6 +812,149 @@ function VitalCard({ icon, label, value, unit, color }) {
       <div className="flex items-baseline gap-2">
         <span className="text-3xl font-bold italic tracking-tight">{value}</span>
         <span className="text-[10px] font-bold text-gray-500 uppercase">{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function DischargePage({ patient_id, role, goBack }) {
+  const [data, setData] = useState(null);
+  const [downloading, setDownloading] = useState(false);
+  const isAdmin = role === 'admin';
+
+  useEffect(() => {
+    axios.get(`${API_BASE}/discharge_report/${patient_id}`)
+      .then(res => setData(res.data))
+      .catch(err => console.error(err));
+  }, [patient_id]);
+
+  if (!data) return (
+    <div className="min-h-screen flex items-center justify-center bg-[#0f172a]">
+      <div className="text-center">
+        <Activity className="animate-spin text-indigo-500 mb-4 mx-auto" size={48} />
+        <p className="text-gray-400 italic">Generating Discharge Report...</p>
+      </div>
+    </div>
+  );
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const res = await axios.post(`${API_BASE}/generate_report/${patient_id}`);
+      window.open(`${API_BASE}${res.data.file_url}`, '_blank');
+    } catch (err) {
+      alert("Error generating PDF: " + (err.response?.data?.detail || err.message));
+    }
+    setDownloading(false);
+  };
+
+  const isDischarged = data.patient?.discharge === true;
+  const decisionDecision = data.decision?.discharge === true;
+  const isReady = isDischarged || decisionDecision;
+
+  return (
+    <div className="min-h-screen bg-[#0f172a] text-white p-6 md:p-10 space-y-8 pb-20">
+      {/* Top Banner */}
+      <div className="max-w-4xl mx-auto flex flex-col md:flex-row justify-between items-start md:items-center gap-6 bg-[#1e293b] p-6 rounded-3xl border border-white/5 shadow-xl">
+        <div>
+          <button onClick={goBack} className="text-gray-400 hover:text-white mb-4 text-xs font-bold uppercase tracking-widest">
+            ← Back to Patient
+          </button>
+          <h1 className="text-2xl font-bold flex items-center gap-3">
+            <CheckCircle2 className="text-emerald-400"/> Discharge Summary
+          </h1>
+          <p className="text-gray-400 mt-2">Patient ID: {patient_id} | Name: {data.patient?.name}</p>
+        </div>
+        <div className="flex gap-4 items-center">
+            {isDischarged ? (
+                <div className="px-4 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl font-bold flex flex-col items-center">
+                   <span className="uppercase text-[10px] tracking-widest">Already Discharged</span>
+                   <span className="text-xs">{data.patient?.discharged_at ? new Date(data.patient.discharged_at).toLocaleString() : ''}</span>
+                </div>
+            ) : isReady ? (
+                <span className="px-4 py-2 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-xl font-bold uppercase text-xs tracking-widest">
+                  ✅ Ready for Discharge
+                </span>
+            ) : (
+                <div className="px-4 py-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-xl max-w-xs">
+                  <span className="font-bold uppercase text-[10px] tracking-widest block mb-1">❌ Not Ready</span>
+                  <span className="text-xs italic">{data.decision?.reason || 'Criteria not met'}</span>
+                </div>
+            )}
+            
+            {isAdmin && isReady && (
+                <button
+                  onClick={handleDownload}
+                  disabled={downloading}
+                  className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold px-6 py-3 rounded-xl uppercase text-xs tracking-widest flex items-center gap-2"
+                >
+                  <Activity size={16} /> {downloading ? 'Generating...' : 'Download PDF'}
+                </button>
+            )}
+        </div>
+      </div>
+
+      <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Patient Profile Snapshot */}
+        <div className="bg-[#1e293b] rounded-3xl p-6 border border-white/5">
+           <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest flex items-center gap-2 mb-4"><Users size={16}/> Profile Snapshot</h3>
+           <div className="space-y-4">
+              <ProfileItem label="Diagnosis" value={data.patient?.disease} />
+              <ProfileItem label="Doctor Notes" value={data.patient?.doctor_notes || 'No notes provided.'} />
+              <ProfileItem label="Admission Date" value={data.patient?.admission_date ? new Date(data.patient.admission_date).toLocaleDateString() : 'N/A'} />
+           </div>
+        </div>
+        
+        {/* Billing Overview */}
+        <div className="bg-[#1e293b] rounded-3xl p-6 border border-white/5">
+           <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest flex items-center gap-2 mb-4"><CreditCard size={16}/> Financial Settlment</h3>
+           <div className="space-y-4 text-sm mt-6">
+              <div className="flex justify-between">
+                 <span className="text-gray-400">Total Bill</span>
+                 <span className="font-bold text-white">₹{data.billing?.total_bill?.toLocaleString()}</span>
+              </div>
+              <div className="flex justify-between">
+                 <span className="text-gray-400">Total Paid</span>
+                 <span className="font-bold text-blue-400">₹{data.payments?.reduce((a, b) => a + b.amount, 0).toLocaleString()}</span>
+              </div>
+              <div className="border-t border-white/10 pt-4 flex justify-between">
+                 <span className="font-bold text-gray-400 uppercase text-xs tracking-widest">Balance</span>
+                 <span className="font-black text-white text-lg">₹{data.billing?.remaining_balance?.toLocaleString()}</span>
+              </div>
+           </div>
+        </div>
+      </div>
+      
+      {/* Vitals & Alerts Highlights */}
+      <div className="max-w-4xl mx-auto space-y-6">
+        <h3 className="text-lg font-bold flex items-center gap-2"><Thermometer/> Critical Highlights</h3>
+        {data.alerts?.length > 0 && (
+           <div className="bg-rose-500/10 border border-rose-500/20 p-4 rounded-2xl mb-4">
+              <h4 className="text-rose-400 text-xs font-bold uppercase tracking-widest mb-2">Recent Alerts</h4>
+              <ul className="list-disc pl-5 space-y-1">
+                 {data.alerts.slice(0, 3).map((a, i) => (
+                    <li key={i} className="text-xs text-rose-200">{a.message} <span className="text-gray-500">({new Date(a.timestamp).toLocaleDateString()})</span></li>
+                 ))}
+              </ul>
+           </div>
+        )}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+           {data.vitals?.slice(0, 4).map((v, i) => (
+             <div key={i} className="bg-[#1e293b] border border-white/5 p-4 rounded-xl text-center">
+                 <span className="block text-[8px] text-gray-500 uppercase font-bold mb-2">{new Date(v.timestamp).toLocaleString([], {hour:'2-digit', minute:'2-digit', month: 'short', day: 'numeric'})}</span>
+                 <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div>
+                      <span className="text-gray-400 block text-[8px] uppercase">HR</span>
+                      <span className="font-bold">{v.heart_rate}</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-400 block text-[8px] uppercase">SpO2</span>
+                      <span className="font-bold">{v.spo2}%</span>
+                    </div>
+                 </div>
+             </div>
+           ))}
+        </div>
       </div>
     </div>
   );
